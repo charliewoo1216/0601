@@ -65,6 +65,16 @@ Tool Executor                      →  exec/read/write/edit/browser + sandbox(m
 각 agent는 `bindings`로 Telegram의 서로 다른 `accountId`(= BotFather로 만든 개별 봇 토큰)에 연결한다
 (`docs/concepts/multi-agent.md`의 "Telegram bots per agent" 예시 그대로 사용 가능).
 
+### 사용자 경험(UX): 휴대폰 1대, 채팅방 4개 (확정)
+
+봇/휴대폰/계정을 늘리는 게 아니라, **본인 Telegram 앱 안에 채팅방 4개**가 생기는 방식으로 확정.
+
+- 봇 4개(코딩/분석/웹/서버)는 각각 고유 사용자명을 가지며, 본인 계정에서 각 봇을 검색해 `/start`만 하면
+  채팅방으로 추가됨 (계정·기기 추가 불필요).
+- 어떤 역할이 필요한지는 **어느 채팅방을 여는지**로 선택 (예: 서버 점검 → `@my_server_bot` 채팅방).
+- 4개 채팅방은 Telegram의 **채팅 폴더(Chat Folders)** 로 묶어 탭 한 번에 전환, 필요하면 각각 **고정(pin)**.
+- 대안(봇 1개 + 그룹 Topics/peer 라우팅으로 채팅방 1개에 합치는 방식)은 라우팅이 복잡해져 채택하지 않음.
+
 ---
 
 ## 3. 환경 변수(`.env`) 설계
