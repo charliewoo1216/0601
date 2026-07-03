@@ -29,7 +29,9 @@ messaging integrations"*)를 실제로 열어 확인한 결과:
 | 배포(Ubuntu, 24시간) | 공식 설치 스크립트(`curl -fsSL https://openclaw.ai/install.sh \| bash`), Docker/Docker Compose, systemd 연동(child-process bridge) | `docs/install/index.md`, `docs/gateway/background-process.md` |
 
 **없는 것 (직접 채워야 하는 부분)**:
-- MySQL/PostgreSQL/Oracle/Tibero 전용 DB 조회 tool → 기본 제공 안 됨, **MCP 서버로 해결** (커뮤니티 Postgres/MySQL MCP 서버 등록, Oracle/Tibero는 자체 MCP 서버 작성 필요할 수 있음)
+- DB 조회 tool → 기본 제공 안 됨. **DB는 SQLite만 지원**하기로 확정(MySQL/PostgreSQL/Oracle/Tibero 지원 안 함) —
+  `exec` 툴로 `sqlite3` CLI를 바로 실행하면 되므로 별도 구현이 사실상 불필요. 더 안전한 구조화된 접근이
+  필요해지면 SQLite 전용 MCP 서버(예: 공식/커뮤니티 `mcp-server-sqlite`)를 `mcp.servers`에 등록
 - "간단한 질문은 Fast 모델, 복잡하면 Reasoning 모델로 자동 승격"하는 **task-복잡도 기반 동적 라우팅**은 없음. OpenClaw의 모델 선택은 기본적으로 **agent당 고정 primary + 장애 시 fallback**(신뢰성 목적, 비용/속도 목적 아님) — `docs/concepts/model-failover.md`. 이 부분이 필요하면 별도 커스텀 확장(후술 Phase 5)으로 채운다.
 
 ---
@@ -45,7 +47,7 @@ LLM Router (Fast/Analysis/…)      →  agent별 고정 model 배정 (모델별
                                        추후 agents.list[].model 값만 바꾸면 교체)
 Claude Max Wrapper                →  extensions/anthropic 의 claude CLI backend (이미 구현됨)
 Tool Executor                      →  exec/read/write/edit/browser + sandbox(mode/scope/backend)
-                                       + mcp.servers (SSH·DB 등 확장은 MCP로)
+                                       + mcp.servers (SSH는 sandbox backend, DB는 SQLite만: exec+sqlite3)
 확장성 (신규 LLM/도구 추가)          →  extensions/ 플러그인 SDK (`openclaw/plugin-sdk`)
 ```
 
@@ -56,7 +58,7 @@ Tool Executor                      →  exec/read/write/edit/browser + sandbox(m
 | Bot(요구사항) | agentId | 기본 tools 프로파일 | sandbox | 1차 모델(provider) — **임의 배정, 나중에 교체 가능** |
 |---|---|---|---|---|
 | Coding | `coding` | `coding` (`group:fs`,`group:runtime`,`group:web`,`group:sessions`,`cron` 등) | `mode: "non-main"`, `backend: "docker"` | `anthropic` (Claude CLI backend = Claude Max) |
-| Analysis | `analysis` | `group:fs`(read 위주) + `group:memory` + DB/RAG용 MCP | `mode: "all"`, `backend: "docker"` | `openai` 또는 `ollama` |
+| Analysis | `analysis` | `group:fs`(read 위주) + `group:memory` + `exec`(sqlite3 CLI로 SQLite 조회) | `mode: "all"`, `backend: "docker"` | `openai` 또는 `ollama` |
 | Web | `web` | `group:web` + `browser`(Playwright) | `mode: "all"`, `backend: "docker"` (sandbox browser) | `openrouter` |
 | Server | `server` | `exec`(elevated 일부 허용) + `group:nodes` | `backend: "ssh"` (대상 Ubuntu 서버로 원격 실행) | `anthropic` 또는 `ollama` |
 
@@ -110,10 +112,8 @@ OLLAMA_BASE_URL=http://<ollama-host>:11434
 ├── openclaw.json              # 실제 배포 설정 (agents/bindings/channels/tools/mcp) — 비밀값 없음
 ├── .env.example
 ├── extensions/                 # 우리가 추가하는 커스텀 OpenClaw 확장 (plugin-sdk 사용)
-│   ├── db-mysql-postgres/       # MCP 서버 or 확장: Analysis/Server bot용 DB 조회
-│   ├── db-oracle-tibero/        # 필요 시 자체 MCP 서버
 │   └── model-router/            # (선택/Phase 5) 대화 내 fast↔reasoning 동적 승격 훅
-├── mcp-servers/                 # 등록할 외부 MCP 서버 설정/설치 스크립트
+├── mcp-servers/                 # (선택) SQLite 전용 MCP 서버 설정 — 기본은 exec+sqlite3로 충분
 ├── scripts/
 │   └── deploy-ubuntu.sh         # 설치 스크립트 + systemd 등록
 └── docs/
@@ -159,8 +159,10 @@ OLLAMA_BASE_URL=http://<ollama-host>:11434
 - [ ] 각 agent `tools.allow/deny`로 과도한 권한 제거 (특히 Server agent의 쓰기/삭제성 명령)
 
 ### Phase 5 — 부족한 부분 커스텀 구현
-- [ ] **DB 도구**: PostgreSQL/MySQL은 기존 오픈소스 MCP 서버 조사 후 `mcp.servers`에 등록
-- [ ] **Oracle/Tibero**: 기존 MCP 서버 존재 여부 조사 → 없으면 최소 기능(조회 전용) 자체 MCP 서버 작성
+- [ ] **DB 도구**: SQLite만 지원 — Analysis agent에 `exec` 허용 후 `sqlite3 <db파일> "<쿼리>"` 형태로 바로 사용,
+  파일 경로는 sandbox workspace 내부로 제한
+- [ ] (선택) 반복적으로 안전한 조회만 노출하고 싶다면 SQLite 전용 MCP 서버를 `mcp.servers`에 등록해
+  임의 쓰기 쿼리를 차단
 - [ ] **(선택) 동적 모델 라우팅**: 정말 필요하다면 요청 분류 후 세션 모델을 즉석에서 바꾸는 소형 훅/확장 작성
   (`session_status(model=...)` 또는 `/model` 전환 메커니즘 활용) — V1 범위에서는 생략 가능,
   agent별 고정 모델 배정으로 실용적으로 충분한지 먼저 운영하며 판단
@@ -179,7 +181,7 @@ OLLAMA_BASE_URL=http://<ollama-host>:11434
 |---|---|---|
 | Claude Max 구독 사용 정책 | `docs/providers/claude-max-api-proxy.md`에 Anthropic이 Claude Code 외 구독 사용을 제한할 수 있다는 경고 존재. 단, 우리는 프록시가 아니라 OpenClaw의 **네이티브 CLI backend**(공식 지원 경로)를 쓰므로 리스크 낮음 — 그래도 확인 필요 | 최신 Anthropic 정책 재확인 |
 | Task-복잡도 기반 자동 라우팅 부재 | agent당 모델이 고정이라 "간단한 질문→Fast, 복잡한 질문→Reasoning" 자동 전환은 기본 미지원 | Phase 5까지 없이 운영해보고 실제로 필요한지 판단 (많은 경우 agent별 고정 모델로 충분) |
-| DB 커넥터(Oracle/Tibero) | 검증된 MCP 서버가 없을 가능성 높음 | 직접 작성 범위/일정 확정 필요 |
+| SQLite 파일 쓰기 권한 | `exec`로 `sqlite3` 직접 실행 시 조회뿐 아니라 쓰기/삭제 쿼리도 가능 | Analysis agent는 읽기 전용 쿼리만 쓰도록 운영 규칙/allow 목록으로 제한, 필요 시 읽기 전용 MCP 서버로 전환 |
 | Server agent 권한 | SSH sandbox backend로 원격 서버 실행 시 권한 범위(쓰기/삭제/재시작) 통제 필요 | `tools.elevated`, `tools.allow/deny` 세부 정책 확정, 위험 명령 실행 전 Telegram 확인 절차 필요 여부 |
 | fork 관리 | OpenClaw 업스트림이 활발히 개발 중(active, 잦은 커밋) — fork를 그대로 두면 업데이트 추적 필요 | 커스텀 확장은 `extensions/`에만 넣어 업스트림 rebase 충돌 최소화, 정기 업스트림 sync 정책 필요 |
 | 비밀값 관리 | `.env` 유출 시 전체 키 노출 (기존 리스크 동일) | 파일 권한, git 제외 유지 |
@@ -190,4 +192,4 @@ OLLAMA_BASE_URL=http://<ollama-host>:11434
 
 1. Phase 0 항목(Telegram 봇 4개 토큰, OpenRouter/OpenAI 키, Ollama 서버 주소, Ubuntu 서버 준비) 확보
 2. `openclaw.json` 초안(4-agent/4-binding) 작성 → Phase 1~2 실제 배포 테스트
-3. DB 도구(Phase 5)에서 쓸 MCP 서버 후보 조사 (Postgres/MySQL 우선, Oracle/Tibero는 추가 조사)
+3. Analysis agent의 SQLite 접근 범위(어떤 디렉터리/파일까지 허용할지) 확정
