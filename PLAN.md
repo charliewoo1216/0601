@@ -44,7 +44,8 @@ Telegram Bots (Coding / Analysis / Web / Server)
 | Gateway/Backend | Python 3.11 + FastAPI | 비동기, LLM/Telegram SDK 생태계 풍부 |
 | Telegram | python-telegram-bot (v21+, async) | webhook/polling 모두 지원 |
 | 작업 큐 | Redis + RQ 또는 Celery | Claude Wrapper 작업 큐, 세션 관리 |
-| LLM 연결 | HTTP API 클라이언트 (OpenAI 호환 스펙 우선) | Fast/Analysis/Reasoning/Search 모두 **API 엔드포인트로만 연결**. 로컬이든 원격이든 이 프로젝트는 LLM 서버를 설치·구동하지 않고 `.env`에 지정된 `BASE_URL`/`API_KEY`/`MODEL`만 사용 |
+| LLM 연결 | HTTP API 클라이언트 (OpenAI 호환 스펙 우선) | Fast/Analysis/Reasoning/Search 모두 **API 엔드포인트로만 연결**. 이 프로젝트는 LLM 서버를 직접 설치·구동하지 않고 `.env`에 지정된 `BASE_URL`/`API_KEY`/`MODEL`만 사용 |
+| 지원 Provider (V1.0) | ① Claude Max (CLI wrapper) ② OpenRouter API ③ OpenAI API ④ Ollama API (별도 서버에서 이미 구동 중인 것을 API로만 연결, 이 프로젝트가 설치하지 않음) | 4개 provider 모두 플러그인 방식으로 등록, 역할(Fast/Analysis/Coding/Reasoning/Search)별 매핑은 `config/models.yaml`의 `routing` 순서만 바꾸면 즉시 교체 가능 (모델명/우선순위는 현재 임의 지정, 추후 변경 예정) |
 | 상태/세션 저장 | SQLite(초기) → PostgreSQL(확장) | 세션, 로그, 사용량 기록 |
 | 컨테이너화 | Docker Compose | Gateway/Redis/DB 컨테이너 (LLM 서버는 포함하지 않음) |
 | 프로세스 관리 | systemd (또는 docker compose + restart:always) | Ubuntu 서버에서 24시간 상시 구동 |
@@ -86,21 +87,20 @@ CLAUDE_WORKDIR=/opt/agent-platform/workspace
 CLAUDE_DEFAULT_MODEL=claude-sonnet-5
 CLAUDE_TIMEOUT_SEC=300
 
-# ── Fast LLM (API) ──────────────────────
-FAST_LLM_BASE_URL=http://<host>:<port>/v1   # 로컬/원격 API 서버 엔드포인트
-FAST_LLM_API_KEY=xxxx
-FAST_LLM_MODEL=gemma-2-9b-it
-
-# ── Analysis LLM (API) ──────────────────
-ANALYSIS_LLM_BASE_URL=http://<host>:<port>/v1
-ANALYSIS_LLM_API_KEY=xxxx
-ANALYSIS_LLM_MODEL=qwen2.5-72b-instruct
-
-# ── Reasoning / Search (OpenRouter 등) ──
-OPENROUTER_API_KEY=xxxx
+# ── OpenRouter ───────────────────────────
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-REASONING_MODEL=anthropic/claude-opus
-SEARCH_MODEL=perplexity/sonar
+OPENROUTER_API_KEY=xxxx
+OPENROUTER_MODEL=anthropic/claude-3.5-sonnet   # 임의 지정, 추후 변경 예정
+
+# ── OpenAI API ───────────────────────────
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=xxxx
+OPENAI_MODEL=gpt-4o-mini                        # 임의 지정, 추후 변경 예정
+
+# ── Ollama API (별도 서버에서 이미 구동 중, 이 프로젝트는 설치 안 함) ──
+OLLAMA_BASE_URL=http://<ollama-host>:11434/v1
+OLLAMA_API_KEY=                                 # 보통 불필요 (빈 값)
+OLLAMA_MODEL=llama3.1:8b                        # 임의 지정, 추후 변경 예정
 
 # ── 검색 API ─────────────────────────────
 SEARCH_PROVIDER=brave                     # brave | serpapi | tavily 등
@@ -120,8 +120,10 @@ SSH_ALLOWED_HOSTS=
 
 원칙:
 - `.env.example`에는 키 이름만 두고 값은 비워둔다 (git에는 example만 커밋, 실제 `.env`는 `.gitignore` 처리)
-- 각 LLM Provider는 `BASE_URL / API_KEY / MODEL` 3종 세트만 있으면 즉시 교체 가능한 구조 (OpenAI 호환 API 가정)
-- 새 LLM을 추가할 때도 코드 수정 없이 `.env`에 `{ROLE}_LLM_BASE_URL/API_KEY/MODEL` 세트만 추가 + `config/models.yaml`에 후보 등록
+- **Provider 정의**(어떤 서비스에 어떻게 접속하는지: `BASE_URL/API_KEY/MODEL`)는 `.env`에만 존재
+- **역할→Provider 매핑**(Fast/Analysis/Coding/Reasoning/Search가 어느 provider를 쓸지, 우선순위/fallback)은 `config/models.yaml`에 분리 — 모델/provider를 바꾸고 싶을 때 `.env` 값 교체나 `models.yaml` 순서 변경만으로 끝나고 코드 수정 불필요
+- 현재 V1.0의 역할별 provider 배정은 **전부 임의 지정(placeholder)** 이며 실사용 전 언제든 교체 가능하도록 설계 (아래 3장 예시 참고)
+- 새 LLM/provider를 추가할 때도 `.env`에 `{PROVIDER}_BASE_URL/API_KEY/MODEL` 세트만 추가 + `config/models.yaml`의 `providers`/`routing`에 등록하면 끝
 
 ---
 
@@ -141,10 +143,9 @@ SSH_ALLOWED_HOSTS=
 │   │   ├── registry.py        # 모델 플러그인 레지스트리
 │   │   └── models/
 │   │       ├── base.py        # LLMProvider 인터페이스 (OpenAI 호환 API 클라이언트)
-│   │       ├── openai_compatible_provider.py   # Fast/Analysis 등 범용 API Provider
-│   │       ├── claude_wrapper_provider.py
-│   │       ├── openrouter_provider.py
-│   │       └── ...
+│   │       ├── openai_compatible_provider.py   # OpenRouter/OpenAI/Ollama 공용 (모두 OpenAI 호환 API)
+│   │       ├── claude_wrapper_provider.py       # Claude Max 전용 (CLI subprocess)
+│   │       └── ...                              # 신규 provider 추가 지점
 │   ├── tools/                  # Tool Executor
 │   │   ├── executor.py         # 실행 디스패처 + 권한 체크
 │   │   ├── bash_tool.py
@@ -175,27 +176,36 @@ SSH_ALLOWED_HOSTS=
 └── tests/
 ```
 
-`config/models.yaml` 예시 (비밀값 없이 env 키 이름만 참조):
+`config/models.yaml` 예시 (비밀값 없이 env 키 이름만 참조, provider 정의와 역할 매핑을 분리):
 ```yaml
-fast:
-  - provider: openai_compatible
-    base_url_env: FAST_LLM_BASE_URL
-    api_key_env: FAST_LLM_API_KEY
-    model_env: FAST_LLM_MODEL
-analysis:
-  - provider: openai_compatible
-    base_url_env: ANALYSIS_LLM_BASE_URL
-    api_key_env: ANALYSIS_LLM_API_KEY
-    model_env: ANALYSIS_LLM_MODEL
-coding:
-  - provider: claude_wrapper
-reasoning:
-  - provider: claude_wrapper
-  - provider: openrouter
-    model_env: REASONING_MODEL
-search:
-  - provider: openrouter
-    model_env: SEARCH_MODEL
+# 1) provider 정의: 어떤 서비스를 어떻게 호출할지 (.env 키 이름만 참조)
+providers:
+  claude_max:
+    type: claude_wrapper
+  openrouter:
+    type: openai_compatible
+    base_url_env: OPENROUTER_BASE_URL
+    api_key_env: OPENROUTER_API_KEY
+    model_env: OPENROUTER_MODEL
+  openai:
+    type: openai_compatible
+    base_url_env: OPENAI_BASE_URL
+    api_key_env: OPENAI_API_KEY
+    model_env: OPENAI_MODEL
+  ollama:
+    type: openai_compatible
+    base_url_env: OLLAMA_BASE_URL
+    api_key_env: OLLAMA_API_KEY
+    model_env: OLLAMA_MODEL
+
+# 2) 역할 → provider 우선순위 (실패 시 다음 provider로 fallback)
+#    ↓ 아래 배정은 전부 임의 지정(placeholder). 순서만 바꾸면 즉시 교체됨.
+routing:
+  fast:      [ollama, openai]
+  analysis:  [openai, ollama]
+  coding:    [claude_max]
+  reasoning: [claude_max, openrouter]
+  search:    [openrouter]
 ```
 
 ---
@@ -205,8 +215,9 @@ search:
 ### Phase 0 — 기반 준비 (0.5주)
 - [ ] Ubuntu 서버 환경 점검 (Docker, Docker Compose, Python 3.11) — **LLM 서버 설치는 불필요**, 접속할 API 엔드포인트만 확보
 - [ ] Telegram Bot 4개 생성 (BotFather), 토큰 발급
-- [ ] 리포지토리 스캐폴딩 (위 구조), `.env.example` 작성 (섹션 2 항목 전부 포함)
+- [ ] 리포지토리 스캐폴딩 (위 구조), `.env.example` 작성 (섹션 2 항목 전부 포함, 4개 provider: Claude Max / OpenRouter / OpenAI / Ollama)
 - [ ] `claude login` 수행하여 Claude Max 인증 세션 확보, `.env`의 `CLAUDE_CONFIG_DIR`에 경로 지정
+- [ ] OpenRouter/OpenAI API 키 발급, Ollama API 엔드포인트(이미 구동 중인 서버 주소) 확보 — 모델명은 placeholder로 우선 진행, 나중에 교체
 - [ ] 사용자 화이트리스트 기반 인증 설계 (Telegram user_id 허용 목록)
 
 ### Phase 1 — AI Gateway 최소 골격 (1주)
@@ -223,13 +234,14 @@ search:
 - [ ] 스트리밍 응답 → Telegram 메시지 스트리밍(edit_message) 반영
 - [ ] 로그 저장 (요청/응답/실행시간/에러)
 
-### Phase 3 — LLM Router + API 기반 LLM 연결 (1~1.5주)
+### Phase 3 — LLM Router + 4개 Provider 연결 (1~1.5주)
 - [ ] `LLMProvider` 공통 인터페이스 정의 (동기/스트리밍 `generate()`, OpenAI 호환 API 기준)
-- [ ] `openai_compatible_provider.py` 구현 — `.env`의 `BASE_URL/API_KEY/MODEL`만으로 Fast/Analysis 어떤 API 서버든 연결 (로컬 서버든 클라우드든 무관)
+- [ ] `openai_compatible_provider.py` 구현 — OpenRouter/OpenAI/Ollama 3개를 동일 클라이언트로 처리 (`.env`의 `BASE_URL/API_KEY/MODEL`만 다름)
+- [ ] `claude_wrapper_provider.py`를 Router의 provider 인터페이스에 맞게 연결 (Coding/Reasoning 기본 엔진)
 - [ ] 요청 분류기(classifier) 구현: 규칙 기반 우선 (키워드/길이/봇 종류) → 추후 소형 분류 모델로 고도화
-- [ ] `models.yaml` 기반 라우팅 설정 (역할별 후보 목록 + fallback 순서, 실제 값은 env에서 주입)
-- [ ] Fast/Analysis 경로를 지정된 API로 연결, Coding/Reasoning은 Claude Wrapper로 연결
-- [ ] API 연결 실패 시 fallback 정책 (예: Fast → Claude Wrapper로 강등)
+- [ ] `models.yaml`의 `providers`/`routing` 로더 구현 (역할별 provider 우선순위 + fallback 순서, 값은 전부 env에서 주입)
+- [ ] 초기 routing 배정(placeholder)으로 4개 provider 전부 end-to-end 동작 검증 — 실제 모델 배정은 나중에 `routing` 순서만 바꿔 교체
+- [ ] Provider 연결 실패 시 다음 순위 provider로 자동 fallback
 
 ### Phase 4 — Tool Executor (1.5~2주)
 - [ ] 권한 제어 설계 (`permissions.yaml` + `.env`의 `TOOL_*_ENABLED` 스위치: 도구별 allow/deny, 명령 화이트리스트, 위험 명령 확인 절차)
@@ -245,8 +257,8 @@ search:
 - [ ] Web Bot (검색 API + Playwright 크롤링 결과 요약 파이프라인, `SEARCH_PROVIDER`/`SEARCH_API_KEY` 사용)
 - [ ] Server Bot (서버 상태 조회/재시작 — 고위험 명령은 반드시 사용자 확인 단계 삽입)
 
-### Phase 6 — 확장 Provider 추가 (병행 가능)
-- [ ] OpenRouter Provider (Reasoning/Search 대체 후보, `.env`의 `OPENROUTER_API_KEY`)
+### Phase 6 — 추가 Provider 확장 (병행 가능)
+- [ ] V1.0의 4개 provider(Claude Max/OpenRouter/OpenAI/Ollama) 외 신규 provider(Gemini, DeepSeek 등) 추가 시 절차 검증
 - [ ] 검색 API Provider (Brave/SerpAPI/Tavily 등, `.env`의 `SEARCH_PROVIDER`로 스위치)
 - [ ] Provider 플러그인 등록 방식 문서화 (신규 LLM 추가 시 `.env` + `models.yaml` 체크리스트)
 
@@ -266,7 +278,8 @@ search:
 |---|---|---|
 | Claude Max Wrapper 인증 | CLI 로그인 세션 방식이라 컨테이너 재시작/서버 이전 시 재로그인 필요 가능 | `CLAUDE_CONFIG_DIR`을 영속 볼륨/디렉터리로 고정, 세션 만료 감지 및 알림 |
 | Claude Max Wrapper 동시성 | CLI 기반이라 동시 세션/Rate limit 이슈 가능 | 큐 직렬화 정책, 동시 실행 수 제한 |
-| 외부 LLM API 엔드포인트 | Fast/Analysis용 API 서버(로컬망 또는 클라우드)의 가용성·지연시간 미확정 | 실제 사용할 API 엔드포인트/제공자 확정 필요 (사용자가 이미 운영 중인 서버가 있는지 확인) |
+| Ollama API 엔드포인트 | 이 프로젝트는 Ollama를 설치하지 않으므로 접속할 서버가 반드시 별도로 이미 구동 중이어야 함 | 실제 Ollama 서버 주소/네트워크 접근성 확인 (아직 없다면 어디에 둘지 결정 필요) |
+| Placeholder 모델 배정 | V1.0의 역할→provider 매핑(예: fast=ollama, analysis=openai)은 임의 지정이라 실제 성능/비용에 안 맞을 수 있음 | 운영 중 `models.yaml`의 `routing` 순서만 조정하면 되므로 초기엔 결정 지연 가능, 실사용 데이터로 추후 튜닝 |
 | 도구 권한 (Bash/SSH/DB) | 잘못된 명령으로 서버 손상 위험 | 위험 명령 목록 정의 + 실행 전 사용자 확인(Telegram 버튼) 도입 여부 |
 | RAG/문서 저장소 | 벡터 DB 선택 미정 | Chroma(로컬, 간단) vs pgvector(확장성) 결정 |
 | 인증 | Telegram만으로 충분한가 | 다중 관리자/사용자 시 역할별 권한 분리 필요 여부 |
@@ -276,6 +289,6 @@ search:
 
 ## 6. 다음 액션
 
-1. Fast/Analysis LLM이 실제로 어떤 API를 가리킬지 확정 (자체 운영 중인 API 서버 주소가 있는지, 아니면 어떤 클라우드 제공자를 쓸지)
+1. 4개 provider(Claude Max/OpenRouter/OpenAI/Ollama) 키·엔드포인트 확보 — 역할별 모델 배정은 placeholder로 두고 진행 (나중에 `routing` 순서만 변경)
 2. `.env.example` 초안에 동의하는지 확인 후 Phase 0~1 스캐폴딩 시작
 3. Ubuntu 서버 접근 정보 확보 (SSH 접속 가능 여부) → `scripts/install.sh` 작성 및 실제 배포 테스트
