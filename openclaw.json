@@ -1,0 +1,102 @@
+// 개인 AI Agent 플랫폼 — OpenClaw 배포 설정 초안 (JSON5)
+// 비밀값은 전혀 없음 — 전부 .env 참조(${VAR}) 또는 <PLACEHOLDER>.
+// 실제 배포 전 <PLACEHOLDER>를 채우고, 모델/도구 정책은 운영하며 조정할 것.
+// 스키마 근거: openclaw 저장소 docs/gateway/config-agents.md, config-channels.md,
+// config-tools.md, sandboxing.md, secrets.md (2026-07 기준 fork 코드로 확인)
+{
+  agents: {
+    list: [
+      {
+        id: "coding",
+        default: true,
+        name: "Coding",
+        workspace: "~/.openclaw/workspace-coding",
+        // Claude Max 구독 세션(claude login)을 그대로 사용하는 CLI backend.
+        model: { primary: "anthropic/claude-opus-4-6" },
+        models: {
+          "anthropic/claude-opus-4-6": { agentRuntime: { id: "claude-cli" } },
+        },
+        tools: { profile: "coding" },
+        sandbox: { mode: "non-main", backend: "docker" },
+      },
+      {
+        id: "analysis",
+        name: "Analysis",
+        workspace: "~/.openclaw/workspace-analysis",
+        model: { primary: "openai/gpt-5.4-mini" }, // 임의 배정, 나중에 교체
+        tools: {
+          allow: ["read", "exec", "memory_search", "memory_get", "group:sessions"],
+          deny: ["write", "edit", "apply_patch", "browser", "canvas"],
+        },
+        sandbox: { mode: "all", backend: "docker" },
+      },
+      {
+        id: "web",
+        name: "Web",
+        workspace: "~/.openclaw/workspace-web",
+        model: { primary: "openrouter/perplexity/sonar" }, // 임의 배정, 나중에 교체
+        tools: {
+          allow: ["group:web", "browser", "group:sessions"],
+          deny: ["exec", "write", "edit", "apply_patch", "group:fs"],
+        },
+        sandbox: { mode: "all", backend: "docker" },
+      },
+      {
+        id: "server",
+        name: "Server",
+        workspace: "~/.openclaw/workspace-server",
+        // 이 agent는 OpenClaw가 실행 중인 바로 그 Ubuntu 서버를 관리하는 용도이므로
+        // 기본적으로 샌드박스 없이(host 직접) 실행한다. 다른 원격 서버까지 관리하려면
+        // sandbox.backend: "ssh" + sandbox.ssh.target 을 추가로 구성할 것.
+        model: { primary: "ollama/llama3.1:8b" }, // 임의 배정, 나중에 교체
+        tools: {
+          allow: ["exec", "read", "group:nodes"],
+          elevated: { enabled: true },
+        },
+        sandbox: { mode: "off" },
+      },
+    ],
+  },
+
+  // Telegram 봇 4개 ↔ agent 4개 매핑. 봇/휴대폰/계정은 늘리지 않고
+  // 본인 Telegram 앱 안에 채팅방 4개가 생기는 방식 (PLAN.md 2장 참고).
+  bindings: [
+    { agentId: "coding", match: { channel: "telegram", accountId: "coding" } },
+    { agentId: "analysis", match: { channel: "telegram", accountId: "analysis" } },
+    { agentId: "web", match: { channel: "telegram", accountId: "web" } },
+    { agentId: "server", match: { channel: "telegram", accountId: "server" } },
+  ],
+
+  channels: {
+    telegram: {
+      // 1인 소유 봇 4개 전부 본인 Telegram 사용자 ID만 허용.
+      accounts: {
+        coding: {
+          botToken: "${TELEGRAM_BOT_TOKEN_CODING}",
+          dmPolicy: "allowlist",
+          allowFrom: ["${TELEGRAM_OWNER_ID}"],
+        },
+        analysis: {
+          botToken: "${TELEGRAM_BOT_TOKEN_ANALYSIS}",
+          dmPolicy: "allowlist",
+          allowFrom: ["${TELEGRAM_OWNER_ID}"],
+        },
+        web: {
+          botToken: "${TELEGRAM_BOT_TOKEN_WEB}",
+          dmPolicy: "allowlist",
+          allowFrom: ["${TELEGRAM_OWNER_ID}"],
+        },
+        server: {
+          botToken: "${TELEGRAM_BOT_TOKEN_SERVER}",
+          dmPolicy: "allowlist",
+          allowFrom: ["${TELEGRAM_OWNER_ID}"],
+        },
+      },
+    },
+  },
+
+  // 장애 시(Rate limit/일시 오류) 다음 provider로 자동 전환하고 싶은 agent만
+  // agents.list[].model 을 { primary, fallbacks:[...] } 형태로 바꿀 것.
+  // 예: coding agent가 실패하면 openrouter의 동급 모델로 넘어가게 하려면
+  //   model: { primary: "anthropic/claude-opus-4-6", fallbacks: ["openrouter/anthropic/claude-opus-4-6"] }
+}

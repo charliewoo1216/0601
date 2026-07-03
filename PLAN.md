@@ -119,15 +119,13 @@ OLLAMA_BASE_URL=http://<ollama-host>:11434
 ```
 0601/                         # 우리 작업 저장소 — 설정/커스텀 확장만 관리
 ├── PLAN.md
-├── openclaw.json              # 실제 배포 설정 (agents/bindings/channels/tools/mcp) — 비밀값 없음
-├── .env.example
-├── extensions/                 # 우리가 추가하는 커스텀 OpenClaw 확장 (plugin-sdk 사용)
-│   └── model-router/            # (선택/Phase 5) 대화 내 fast↔reasoning 동적 승격 훅
-├── mcp-servers/                 # (선택) SQLite 전용 MCP 서버 설정 — 기본은 exec+sqlite3로 충분
-├── scripts/
-│   └── deploy-ubuntu.sh         # 설치 스크립트 + systemd 등록
+├── openclaw.json              # ✅ 작성됨 — 4-agent/4-binding 배포 설정 초안, 비밀값 없음
+├── .env.example                # ✅ 작성됨 — 봇 토큰/API 키/Ollama 주소 자리만 (값은 사용자가 채움)
+├── extensions/                 # (Phase 5, 아직 없음) 커스텀 OpenClaw 확장이 필요해지면 추가
+│   └── model-router/            # (선택) 대화 내 fast↔reasoning 동적 승격 훅
+├── mcp-servers/                 # (선택) SQLite 전용 MCP 서버 설정 — 기본은 exec+sqlite3로 충분, 지금은 불필요
 └── docs/
-    └── ops-runbook.md
+    └── ops-runbook.md           # ✅ 작성됨 — Ubuntu 서버에서 실행할 명령 순서 (openclaw gateway install 등)
 ```
 
 `charliewoo1216/openclaw` (fork)는 별도 workspace(`/workspace/openclaw`)에서 관리한다.
@@ -140,22 +138,27 @@ OLLAMA_BASE_URL=http://<ollama-host>:11434
 
 ### Phase 0 — 기반 준비
 - [x] OpenClaw 저장소 fork 및 클론 확인 (`charliewoo1216/openclaw`)
-- [ ] Ubuntu 서버에 Node 22.19+/24, (선택)Docker 설치 확인
-- [ ] `claude login` 수행 (Claude Max 세션 확보 — CLI backend가 이 세션을 그대로 사용)
-- [ ] Telegram Bot 4개 생성 (BotFather), 토큰 4개 확보
-- [ ] OpenRouter/OpenAI API 키 발급, Ollama 서버 주소 확보
-- [ ] `openclaw.json` / `0601` 저장소 분리 방식 확정 (fork에 직접 두는지, 별도 config repo로 두는지)
+- [x] `openclaw.json` 초안 작성 (4-agent/4-binding/tools/sandbox, 비밀값 없이 `${VAR}` 참조)
+- [x] `.env.example` 작성, `docs/ops-runbook.md`(실행 순서) 작성
+- [ ] **(사용자 작업)** Ubuntu 서버 준비 — Node 22.19+/24, (선택)Docker 설치 확인
+- [ ] **(사용자 작업)** 서버에서 `claude login` 수행 (Claude Max 세션 확보)
+- [ ] **(사용자 작업)** Telegram Bot 4개 생성 (BotFather), 토큰 4개 확보
+- [ ] **(사용자 작업)** OpenRouter/OpenAI API 키 발급, Ollama 서버 주소 확보
+- [ ] **(사용자 작업)** 본인 Telegram 사용자 ID 확인 (`.env`의 `TELEGRAM_OWNER_ID`)
 
-### Phase 1 — OpenClaw 설치 + 단일 Agent 동작 확인
+> 위 "사용자 작업" 항목은 계정/서버/휴대폰이 필요해 에이전트가 대신 할 수 없음.
+> 값을 확보하면 `docs/ops-runbook.md` 순서대로 실제 배포(Phase 1~2)를 진행한다.
+
+### Phase 1 — OpenClaw 설치 + 단일 Agent 동작 확인 (`docs/ops-runbook.md` 1~4단계)
 - [ ] Ubuntu 서버에 설치 스크립트로 OpenClaw 설치
-- [ ] Telegram 기본 채널 1개 연결, 기본(main) agent로 대화 확인 (`openclaw onboard`)
+- [ ] `~/.openclaw/openclaw.json`, `~/.openclaw/.env` 배치 (이 저장소의 파일 그대로 복사 후 값 채움)
+- [ ] `openclaw doctor`로 설정 검증 (SecretRef `${VAR}` resolve 확인)
 - [ ] Claude CLI backend가 정상 동작하는지 확인 (Claude Max 세션으로 응답 생성되는지)
 
-### Phase 2 — 4-Agent / 4-Bot 멀티 라우팅 구성
-- [ ] `openclaw agents add coding|analysis|web|server` 로 4개 agent 생성
-- [ ] `channels.telegram.accounts.<id>` 4개 등록 (각 봇 토큰), `bindings`로 agent와 연결
-- [ ] agent별 1차 모델 배정 (표 2번 기준, 임의 배정 — 나중에 교체)
-- [ ] `openclaw agents list --bindings`, `openclaw channels status --probe` 로 검증
+### Phase 2 — 4-Agent / 4-Bot 멀티 라우팅 구성 (`docs/ops-runbook.md` 5단계)
+- [x] `openclaw.json`에 4개 agent(coding/analysis/web/server) + 4개 telegram accountId + bindings 정의 완료
+- [ ] 실제 서버에서 `openclaw agents list --bindings`, `openclaw channels status --probe` 로 검증
+- [ ] Telegram 앱에서 4개 채팅방 각각 `/start` 후 응답 확인
 
 ### Phase 3 — Provider 4종 연결 검증
 - [ ] anthropic(CLI backend), openrouter, openai, ollama 각각 최소 1개 agent에서 응답 확인
