@@ -1,294 +1,193 @@
-# 개인 AI Agent 플랫폼 구현 계획 (V1.0)
+# 개인 AI Agent 플랫폼 구현 계획 (V2.0 — OpenClaw 기반)
 
-> 본 문서는 `요구사항 V1.0`을 실제로 구축하기 위한 단계별 실행 계획이다.
-> 목표: Ubuntu 서버에서 24시간 상시 동작하는, Telegram 기반의 단일 AI Gateway +
-> 멀티 LLM Router + Tool Executor 구조의 개인 AI Agent 플랫폼.
-
----
-
-## 0. 설계 요약
-
-```
-Telegram Bots (Coding / Analysis / Web / Server)
-        │  (webhook or long-polling)
-        ▼
-   AI Gateway (FastAPI)  ── 인증 / 세션 / 라우팅 진입점
-        │
-   LLM Router            ── 요청 분류 후 최적 모델 선택
-        │
-   ┌────┴─────────────────────────────────────┐
-   │  Fast │ Analysis │ Coding │ Reasoning │ Search
-   └────┬─────────────────────────────────────┘
-        │
-   Tool Executor          ── 샌드박스 내 도구 실행 (Bash/Git/Docker/...)
-        │
-   결과 스트리밍 → Telegram
-```
-
-핵심 원칙:
-- Telegram = UI만 담당 (비즈니스 로직 없음)
-- Gateway = 모든 요청의 단일 진입점, 인증/로깅/큐잉 담당
-- Router = 플러그인 구조 (모델 추가 시 코드 최소 변경)
-- 모든 LLM(로컬/원격 포함)은 **API로만 연결** — 이 프로젝트가 LLM 서버를 직접 설치/구동하지 않음
-- 모든 설정값(엔드포인트, 키, 모델명, 봇 토큰 등)은 **`.env` 하나로 관리**
-- Claude Max Wrapper = 코딩/추론 기본 엔진 (claude CLI 래핑)
-- Tool Executor = 모든 도구 실행을 격리된 컨텍스트에서 수행 (권한 제어 필수)
-- 배포 대상 = Ubuntu 서버 단일 환경 (24시간 상시 구동)
+> V1.0에서는 Gateway/LLM Router/Tool Executor를 처음부터 설계했으나, 실제 요구사항 대부분을
+> 이미 구현하고 있는 오픈소스 프로젝트 **OpenClaw**(https://github.com/openclaw/openclaw,
+> fork: https://github.com/charliewoo1216/openclaw)를 확인한 뒤 방향을 전환했다.
+> **처음부터 만들지 않고, OpenClaw를 채택 → 설정(config) → 필요한 부분만 소스코드/확장(extension)으로
+> 수정·추가**하는 방식으로 진행한다.
 
 ---
 
-## 1. 기술 스택 (제안)
+## 0. 왜 OpenClaw인가 (근거)
 
-| 영역 | 선택 | 사유 |
+저장소(`/workspace/openclaw`, `package.json` 설명: *"Multi-channel AI gateway with extensible
+messaging integrations"*)를 실제로 열어 확인한 결과:
+
+| 우리가 설계하려던 것 | OpenClaw에 이미 있는 것 | 근거 파일 |
 |---|---|---|
-| Gateway/Backend | Python 3.11 + FastAPI | 비동기, LLM/Telegram SDK 생태계 풍부 |
-| Telegram | python-telegram-bot (v21+, async) | webhook/polling 모두 지원 |
-| 작업 큐 | Redis + RQ 또는 Celery | Claude Wrapper 작업 큐, 세션 관리 |
-| LLM 연결 | HTTP API 클라이언트 (OpenAI 호환 스펙 우선) | Fast/Analysis/Reasoning/Search 모두 **API 엔드포인트로만 연결**. 이 프로젝트는 LLM 서버를 직접 설치·구동하지 않고 `.env`에 지정된 `BASE_URL`/`API_KEY`/`MODEL`만 사용 |
-| 지원 Provider (V1.0) | ① Claude Max (CLI wrapper) ② OpenRouter API ③ OpenAI API ④ Ollama API (별도 서버에서 이미 구동 중인 것을 API로만 연결, 이 프로젝트가 설치하지 않음) | 4개 provider 모두 플러그인 방식으로 등록, 역할(Fast/Analysis/Coding/Reasoning/Search)별 매핑은 `config/models.yaml`의 `routing` 순서만 바꾸면 즉시 교체 가능 (모델명/우선순위는 현재 임의 지정, 추후 변경 예정) |
-| 상태/세션 저장 | SQLite(초기) → PostgreSQL(확장) | 세션, 로그, 사용량 기록 |
-| 컨테이너화 | Docker Compose | Gateway/Redis/DB 컨테이너 (LLM 서버는 포함하지 않음) |
-| 프로세스 관리 | systemd (또는 docker compose + restart:always) | Ubuntu 서버에서 24시간 상시 구동 |
-| MCP 연동 | mcp Python SDK | Tool Executor 확장 포인트 |
-| Claude 연동 | Claude Code CLI (Max 구독) subprocess wrapper | `.env`에 인증 정보 지정, CLI를 큐로 감싸서 사용 |
+| Telegram Gateway, 다중 Bot | `channels.telegram.accounts.<id>` — 채널당 여러 봇 계정 지원 | `docs/concepts/multi-agent.md` |
+| 역할별 Bot(코딩/분석/웹/서버) | **Multi-agent routing**: `agents.list[]` 각각 독립 workspace/model/tool정책/sandbox, `bindings`로 채널 계정 ↔ agent 매핑 | `docs/concepts/multi-agent.md` |
+| Claude Max Wrapper (CLI 래핑, 세션, JSON, 스트리밍) | `anthropic` 확장의 **CLI backend**가 `claude -p --output-format stream-json --session-id --resume` 를 그대로 구현, MCP 번들링까지 포함 | `extensions/anthropic/cli-backend.ts` |
+| OpenRouter / OpenAI / Ollama Provider | 전부 built-in 확장으로 존재 (`extensions/openrouter`, `extensions/ollama`, OpenAI는 core) | `extensions/openrouter`, `extensions/ollama` |
+| Tool Executor: Bash/Python | `exec` 툴 (`group:runtime`), 백그라운드 실행/타임아웃/승격 실행 지원 | `docs/gateway/background-process.md`, `docs/gateway/config-tools.md` |
+| Tool Executor: File Editor | `read/write/edit/apply_patch` (`group:fs`) | `docs/gateway/config-tools.md` |
+| Tool Executor: Browser | `browser` 툴 (Playwright 기반, CDP, sandbox 격리) | `docs/gateway/sandboxing.md` |
+| Tool Executor: Docker 격리 | `sandbox.mode/scope/backend` — agent/session/shared 단위 Docker 컨테이너 격리 | `docs/gateway/sandboxing.md` |
+| Tool Executor: SSH | **sandbox backend로 `"ssh"` 지원** — 원격 호스트에 SSH로 실행 (Server bot에 적합) | `docs/gateway/sandboxing.md` (`sandbox.ssh.target`, `identityFile`) |
+| Tool Executor: MCP | `mcp.servers` 설정으로 외부 MCP 서버 등록, 에이전트별 tool 허용목록으로 노출 제어 | `docs/gateway/config-tools.md` |
+| 권한 제어 (도구별 allow/deny, 위험 명령 확인) | `tools.profile`(`minimal/coding/messaging/full`), `tools.allow/deny`, `agents.list[].tools`, `tools.elevated` | `docs/gateway/config-tools.md`, `docs/tools/elevated.md` |
+| 배포(Ubuntu, 24시간) | 공식 설치 스크립트(`curl -fsSL https://openclaw.ai/install.sh \| bash`), Docker/Docker Compose, systemd 연동(child-process bridge) | `docs/install/index.md`, `docs/gateway/background-process.md` |
 
-> 참고: Claude Max는 공개 API 요금제가 아니라 `claude` CLI 로그인 세션을 사용하는 구독제이다.
-> 인증 방식은 두 가지를 모두 지원하도록 설계한다.
-> 1) `claude login`으로 생성된 자격 증명 디렉터리를 `.env`의 `CLAUDE_CONFIG_DIR` 경로로 지정 (기본 권장)
-> 2) 별도 API 키/토큰 기반 인증을 쓰는 경우 `CLAUDE_MAX_AUTH_TOKEN` 등으로 `.env`에 저장 후 wrapper가 주입
-> 어느 방식이든 **키/토큰 원문은 절대 코드나 config yaml에 하드코딩하지 않고 `.env`에서만 로드**한다.
+**없는 것 (직접 채워야 하는 부분)**:
+- MySQL/PostgreSQL/Oracle/Tibero 전용 DB 조회 tool → 기본 제공 안 됨, **MCP 서버로 해결** (커뮤니티 Postgres/MySQL MCP 서버 등록, Oracle/Tibero는 자체 MCP 서버 작성 필요할 수 있음)
+- "간단한 질문은 Fast 모델, 복잡하면 Reasoning 모델로 자동 승격"하는 **task-복잡도 기반 동적 라우팅**은 없음. OpenClaw의 모델 선택은 기본적으로 **agent당 고정 primary + 장애 시 fallback**(신뢰성 목적, 비용/속도 목적 아님) — `docs/concepts/model-failover.md`. 이 부분이 필요하면 별도 커스텀 확장(후술 Phase 5)으로 채운다.
 
 ---
 
-## 2. 환경 변수(`.env`) 설계
+## 1. 핵심 개념 매핑 (요구사항 → OpenClaw)
 
-모든 실행 옵션(엔드포인트, 키, 모델명, 봇 토큰, 권한 스위치)은 `.env` 하나로 제어한다.
-`config/*.yaml`에는 **비밀값을 넣지 않고**, 라우팅 우선순위·타임아웃 같은 비민감 설정만 둔다.
+```
+요구사항                          →  OpenClaw 개념
+──────────────────────────────────────────────────────
+Telegram Bot 4종(코딩/분석/웹/서버)  →  agents.list[] 4개 + 각기 다른 telegram accountId
+                                       + bindings로 봇↔agent 연결
+LLM Router (Fast/Analysis/…)      →  agent별 고정 model 배정 (모델별 provider는 임의 지정,
+                                       추후 agents.list[].model 값만 바꾸면 교체)
+Claude Max Wrapper                →  extensions/anthropic 의 claude CLI backend (이미 구현됨)
+Tool Executor                      →  exec/read/write/edit/browser + sandbox(mode/scope/backend)
+                                       + mcp.servers (SSH·DB 등 확장은 MCP로)
+확장성 (신규 LLM/도구 추가)          →  extensions/ 플러그인 SDK (`openclaw/plugin-sdk`)
+```
+
+---
+
+## 2. 4개 Bot ↔ Agent 설계 (초안, 값은 배치 전 확정)
+
+| Bot(요구사항) | agentId | 기본 tools 프로파일 | sandbox | 1차 모델(provider) — **임의 배정, 나중에 교체 가능** |
+|---|---|---|---|---|
+| Coding | `coding` | `coding` (`group:fs`,`group:runtime`,`group:web`,`group:sessions`,`cron` 등) | `mode: "non-main"`, `backend: "docker"` | `anthropic` (Claude CLI backend = Claude Max) |
+| Analysis | `analysis` | `group:fs`(read 위주) + `group:memory` + DB/RAG용 MCP | `mode: "all"`, `backend: "docker"` | `openai` 또는 `ollama` |
+| Web | `web` | `group:web` + `browser`(Playwright) | `mode: "all"`, `backend: "docker"` (sandbox browser) | `openrouter` |
+| Server | `server` | `exec`(elevated 일부 허용) + `group:nodes` | `backend: "ssh"` (대상 Ubuntu 서버로 원격 실행) | `anthropic` 또는 `ollama` |
+
+각 agent는 `bindings`로 Telegram의 서로 다른 `accountId`(= BotFather로 만든 개별 봇 토큰)에 연결한다
+(`docs/concepts/multi-agent.md`의 "Telegram bots per agent" 예시 그대로 사용 가능).
+
+---
+
+## 3. 환경 변수(`.env`) 설계
+
+OpenClaw는 자체 `.env.example`(레포 루트)을 이미 제공한다. 우리는 그 컨벤션을 그대로 따르되,
+필요한 4개 provider + 4개 Telegram 봇 토큰만 채운다.
 
 ```dotenv
 # ── Gateway ─────────────────────────────
-GATEWAY_HOST=0.0.0.0
-GATEWAY_PORT=8000
-GATEWAY_LOG_LEVEL=info
-GATEWAY_SECRET_KEY=changeme
+OPENCLAW_GATEWAY_TOKEN=              # openssl rand -hex 32 로 생성
 
-# ── Telegram ────────────────────────────
-TELEGRAM_BOT_TOKEN_CODING=xxxx
-TELEGRAM_BOT_TOKEN_ANALYSIS=xxxx
+# ── Telegram (봇 4개, 각각 BotFather에서 발급) ──
+TELEGRAM_BOT_TOKEN=xxxx              # accountId: default → coding agent
+TELEGRAM_BOT_TOKEN_ANALYSIS=xxxx     # openclaw.json의 channels.telegram.accounts.analysis.botToken 로 참조
 TELEGRAM_BOT_TOKEN_WEB=xxxx
 TELEGRAM_BOT_TOKEN_SERVER=xxxx
-TELEGRAM_ALLOWED_USER_IDS=111111,222222
 
-# ── Claude Max Wrapper ──────────────────
-CLAUDE_CLI_PATH=/usr/local/bin/claude
-CLAUDE_CONFIG_DIR=/root/.claude          # claude login 세션 디렉터리
-CLAUDE_MAX_AUTH_TOKEN=                    # 필요 시에만 사용 (선택)
-CLAUDE_WORKDIR=/opt/agent-platform/workspace
-CLAUDE_DEFAULT_MODEL=claude-sonnet-5
-CLAUDE_TIMEOUT_SEC=300
+# ── Claude Max (CLI backend, API 키 아님) ──
+# claude login 을 서버에서 먼저 수행 → ~/.claude 세션 재사용
+# (OpenClaw가 자동으로 `claude` CLI를 호출하므로 별도 ANTHROPIC_API_KEY 불필요)
 
 # ── OpenRouter ───────────────────────────
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_API_KEY=xxxx
-OPENROUTER_MODEL=anthropic/claude-3.5-sonnet   # 임의 지정, 추후 변경 예정
 
 # ── OpenAI API ───────────────────────────
-OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_API_KEY=xxxx
-OPENAI_MODEL=gpt-4o-mini                        # 임의 지정, 추후 변경 예정
 
-# ── Ollama API (별도 서버에서 이미 구동 중, 이 프로젝트는 설치 안 함) ──
-OLLAMA_BASE_URL=http://<ollama-host>:11434/v1
-OLLAMA_API_KEY=                                 # 보통 불필요 (빈 값)
-OLLAMA_MODEL=llama3.1:8b                        # 임의 지정, 추후 변경 예정
-
-# ── 검색 API ─────────────────────────────
-SEARCH_PROVIDER=brave                     # brave | serpapi | tavily 등
-SEARCH_API_KEY=xxxx
-
-# ── 인프라 ───────────────────────────────
-REDIS_URL=redis://localhost:6379/0
-DATABASE_URL=sqlite:///./data/app.db      # 추후 postgresql://... 로 교체
-
-# ── Tool Executor 권한 ──────────────────
-TOOL_BASH_ENABLED=true
-TOOL_SSH_ENABLED=false
-TOOL_DOCKER_ENABLED=true
-TOOL_DB_ENABLED=false
-SSH_ALLOWED_HOSTS=
+# ── Ollama (원격/기존 서버, 이 프로젝트가 설치 안 함) ──
+OLLAMA_BASE_URL=http://<ollama-host>:11434
 ```
 
-원칙:
-- `.env.example`에는 키 이름만 두고 값은 비워둔다 (git에는 example만 커밋, 실제 `.env`는 `.gitignore` 처리)
-- **Provider 정의**(어떤 서비스에 어떻게 접속하는지: `BASE_URL/API_KEY/MODEL`)는 `.env`에만 존재
-- **역할→Provider 매핑**(Fast/Analysis/Coding/Reasoning/Search가 어느 provider를 쓸지, 우선순위/fallback)은 `config/models.yaml`에 분리 — 모델/provider를 바꾸고 싶을 때 `.env` 값 교체나 `models.yaml` 순서 변경만으로 끝나고 코드 수정 불필요
-- 현재 V1.0의 역할별 provider 배정은 **전부 임의 지정(placeholder)** 이며 실사용 전 언제든 교체 가능하도록 설계 (아래 3장 예시 참고)
-- 새 LLM/provider를 추가할 때도 `.env`에 `{PROVIDER}_BASE_URL/API_KEY/MODEL` 세트만 추가 + `config/models.yaml`의 `providers`/`routing`에 등록하면 끝
+원칙(V1.0에서 정한 것과 동일하게 유지):
+- 비밀값은 전부 `.env`. `openclaw.json`에는 구조(agents/bindings/tools/mcp) — 즉 "무엇을 어떻게
+  연결할지"만 두고 키 원문은 두지 않는다.
+- provider/모델 배정은 `openclaw.json`의 `agents.list[].model` 값만 바꾸면 코드 수정 없이 교체된다
+  (V1.0에서 설계한 `models.yaml`의 역할을 OpenClaw의 `agents.list[].model` + `agents.defaults.model.fallbacks`가 대신함).
 
 ---
 
-## 3. 리포지토리 구조 (제안)
+## 4. 리포지토리/작업 구성
 
 ```
-0601/
+0601/                         # 우리 작업 저장소 — 설정/커스텀 확장만 관리
 ├── PLAN.md
-├── docker-compose.yml          # Gateway + Redis (+ 필요 시 Postgres) 만 포함, LLM 서버 없음
+├── openclaw.json              # 실제 배포 설정 (agents/bindings/channels/tools/mcp) — 비밀값 없음
 ├── .env.example
-├── gateway/                  # AI Gateway (FastAPI)
-│   ├── main.py
-│   ├── settings.py             # .env 로드 (pydantic-settings)
-│   ├── auth.py                # Telegram 사용자 화이트리스트 인증
-│   ├── router/                # LLM Router
-│   │   ├── classifier.py      # 요청 분류 (fast/analysis/coding/reasoning/search)
-│   │   ├── registry.py        # 모델 플러그인 레지스트리
-│   │   └── models/
-│   │       ├── base.py        # LLMProvider 인터페이스 (OpenAI 호환 API 클라이언트)
-│   │       ├── openai_compatible_provider.py   # OpenRouter/OpenAI/Ollama 공용 (모두 OpenAI 호환 API)
-│   │       ├── claude_wrapper_provider.py       # Claude Max 전용 (CLI subprocess)
-│   │       └── ...                              # 신규 provider 추가 지점
-│   ├── tools/                  # Tool Executor
-│   │   ├── executor.py         # 실행 디스패처 + 권한 체크
-│   │   ├── bash_tool.py
-│   │   ├── python_tool.py
-│   │   ├── git_tool.py
-│   │   ├── docker_tool.py
-│   │   ├── ssh_tool.py
-│   │   ├── browser_tool.py     # Playwright
-│   │   ├── file_editor_tool.py
-│   │   ├── db_tool.py          # MySQL/PG/Oracle/Tibero
-│   │   └── mcp_tool.py
-│   ├── claude_wrapper/
-│   │   ├── wrapper.py          # claude CLI subprocess 래퍼
-│   │   ├── session_manager.py
-│   │   └── queue.py
-│   └── logging_store.py
-├── bots/                       # Telegram Bot 4종 (얇은 레이어, Gateway 호출만)
-│   ├── coding_bot.py
-│   ├── analysis_bot.py
-│   ├── web_bot.py
-│   └── server_bot.py
-├── config/
-│   ├── models.yaml             # LLM 역할별 후보 목록/우선순위/fallback (비밀값 없음, env 키 이름만 참조)
-│   └── permissions.yaml        # 도구별 허용 범위, 화이트리스트
+├── extensions/                 # 우리가 추가하는 커스텀 OpenClaw 확장 (plugin-sdk 사용)
+│   ├── db-mysql-postgres/       # MCP 서버 or 확장: Analysis/Server bot용 DB 조회
+│   ├── db-oracle-tibero/        # 필요 시 자체 MCP 서버
+│   └── model-router/            # (선택/Phase 5) 대화 내 fast↔reasoning 동적 승격 훅
+├── mcp-servers/                 # 등록할 외부 MCP 서버 설정/설치 스크립트
 ├── scripts/
-│   ├── install.sh               # Ubuntu 서버용 설치 스크립트
-│   └── systemd/*.service
-└── tests/
+│   └── deploy-ubuntu.sh         # 설치 스크립트 + systemd 등록
+└── docs/
+    └── ops-runbook.md
 ```
 
-`config/models.yaml` 예시 (비밀값 없이 env 키 이름만 참조, provider 정의와 역할 매핑을 분리):
-```yaml
-# 1) provider 정의: 어떤 서비스를 어떻게 호출할지 (.env 키 이름만 참조)
-providers:
-  claude_max:
-    type: claude_wrapper
-  openrouter:
-    type: openai_compatible
-    base_url_env: OPENROUTER_BASE_URL
-    api_key_env: OPENROUTER_API_KEY
-    model_env: OPENROUTER_MODEL
-  openai:
-    type: openai_compatible
-    base_url_env: OPENAI_BASE_URL
-    api_key_env: OPENAI_API_KEY
-    model_env: OPENAI_MODEL
-  ollama:
-    type: openai_compatible
-    base_url_env: OLLAMA_BASE_URL
-    api_key_env: OLLAMA_API_KEY
-    model_env: OLLAMA_MODEL
-
-# 2) 역할 → provider 우선순위 (실패 시 다음 provider로 fallback)
-#    ↓ 아래 배정은 전부 임의 지정(placeholder). 순서만 바꾸면 즉시 교체됨.
-routing:
-  fast:      [ollama, openai]
-  analysis:  [openai, ollama]
-  coding:    [claude_max]
-  reasoning: [claude_max, openrouter]
-  search:    [openrouter]
-```
+`charliewoo1216/openclaw` (fork)는 별도 workspace(`/workspace/openclaw`)에서 관리한다.
+우리가 커스텀 확장을 만들 때만 그 fork에 커밋하고, 이 `0601` 저장소에는 **배포 설정과 계획/운영 문서**를 둔다.
+(두 저장소를 분리 유지할지, 하나로 합칠지는 Phase 0에서 확정)
 
 ---
 
-## 4. 단계별 실행 계획
+## 5. 단계별 실행 계획
 
-### Phase 0 — 기반 준비 (0.5주)
-- [ ] Ubuntu 서버 환경 점검 (Docker, Docker Compose, Python 3.11) — **LLM 서버 설치는 불필요**, 접속할 API 엔드포인트만 확보
-- [ ] Telegram Bot 4개 생성 (BotFather), 토큰 발급
-- [ ] 리포지토리 스캐폴딩 (위 구조), `.env.example` 작성 (섹션 2 항목 전부 포함, 4개 provider: Claude Max / OpenRouter / OpenAI / Ollama)
-- [ ] `claude login` 수행하여 Claude Max 인증 세션 확보, `.env`의 `CLAUDE_CONFIG_DIR`에 경로 지정
-- [ ] OpenRouter/OpenAI API 키 발급, Ollama API 엔드포인트(이미 구동 중인 서버 주소) 확보 — 모델명은 placeholder로 우선 진행, 나중에 교체
-- [ ] 사용자 화이트리스트 기반 인증 설계 (Telegram user_id 허용 목록)
+### Phase 0 — 기반 준비
+- [x] OpenClaw 저장소 fork 및 클론 확인 (`charliewoo1216/openclaw`)
+- [ ] Ubuntu 서버에 Node 22.19+/24, (선택)Docker 설치 확인
+- [ ] `claude login` 수행 (Claude Max 세션 확보 — CLI backend가 이 세션을 그대로 사용)
+- [ ] Telegram Bot 4개 생성 (BotFather), 토큰 4개 확보
+- [ ] OpenRouter/OpenAI API 키 발급, Ollama 서버 주소 확보
+- [ ] `openclaw.json` / `0601` 저장소 분리 방식 확정 (fork에 직접 두는지, 별도 config repo로 두는지)
 
-### Phase 1 — AI Gateway 최소 골격 (1주)
-- [ ] `pydantic-settings` 기반 `.env` 로더(`settings.py`) 구현 — 모든 하드코딩 제거
-- [ ] FastAPI Gateway 기본 서버 (`/health`, `/chat` 엔드포인트)
-- [ ] Telegram Bot → Gateway 호출 연결 (Bot 1개로 우선 검증, 예: Coding Bot)
-- [ ] 요청/응답 로깅 (구조화 로그, 세션 ID 부여)
-- [ ] 기본 인증 미들웨어 (허용된 Telegram user_id만 통과)
+### Phase 1 — OpenClaw 설치 + 단일 Agent 동작 확인
+- [ ] Ubuntu 서버에 설치 스크립트로 OpenClaw 설치
+- [ ] Telegram 기본 채널 1개 연결, 기본(main) agent로 대화 확인 (`openclaw onboard`)
+- [ ] Claude CLI backend가 정상 동작하는지 확인 (Claude Max 세션으로 응답 생성되는지)
 
-### Phase 2 — Claude Max Wrapper (1주)
-- [ ] `claude` CLI subprocess 래퍼 구현 (`.env`의 `CLAUDE_CLI_PATH`/`CLAUDE_CONFIG_DIR`/`CLAUDE_WORKDIR` 사용, 타임아웃, JSON 출력 파싱)
-- [ ] 작업 큐 도입 (Redis + RQ) — 동시 요청 직렬화/세션별 격리
-- [ ] 세션 관리 (사용자별 대화 컨텍스트 유지/초기화 명령)
-- [ ] 스트리밍 응답 → Telegram 메시지 스트리밍(edit_message) 반영
-- [ ] 로그 저장 (요청/응답/실행시간/에러)
+### Phase 2 — 4-Agent / 4-Bot 멀티 라우팅 구성
+- [ ] `openclaw agents add coding|analysis|web|server` 로 4개 agent 생성
+- [ ] `channels.telegram.accounts.<id>` 4개 등록 (각 봇 토큰), `bindings`로 agent와 연결
+- [ ] agent별 1차 모델 배정 (표 2번 기준, 임의 배정 — 나중에 교체)
+- [ ] `openclaw agents list --bindings`, `openclaw channels status --probe` 로 검증
 
-### Phase 3 — LLM Router + 4개 Provider 연결 (1~1.5주)
-- [ ] `LLMProvider` 공통 인터페이스 정의 (동기/스트리밍 `generate()`, OpenAI 호환 API 기준)
-- [ ] `openai_compatible_provider.py` 구현 — OpenRouter/OpenAI/Ollama 3개를 동일 클라이언트로 처리 (`.env`의 `BASE_URL/API_KEY/MODEL`만 다름)
-- [ ] `claude_wrapper_provider.py`를 Router의 provider 인터페이스에 맞게 연결 (Coding/Reasoning 기본 엔진)
-- [ ] 요청 분류기(classifier) 구현: 규칙 기반 우선 (키워드/길이/봇 종류) → 추후 소형 분류 모델로 고도화
-- [ ] `models.yaml`의 `providers`/`routing` 로더 구현 (역할별 provider 우선순위 + fallback 순서, 값은 전부 env에서 주입)
-- [ ] 초기 routing 배정(placeholder)으로 4개 provider 전부 end-to-end 동작 검증 — 실제 모델 배정은 나중에 `routing` 순서만 바꿔 교체
-- [ ] Provider 연결 실패 시 다음 순위 provider로 자동 fallback
+### Phase 3 — Provider 4종 연결 검증
+- [ ] anthropic(CLI backend), openrouter, openai, ollama 각각 최소 1개 agent에서 응답 확인
+- [ ] `agents.defaults.model.fallbacks` 로 장애 시 대체 provider 체인 구성
 
-### Phase 4 — Tool Executor (1.5~2주)
-- [ ] 권한 제어 설계 (`permissions.yaml` + `.env`의 `TOOL_*_ENABLED` 스위치: 도구별 allow/deny, 명령 화이트리스트, 위험 명령 확인 절차)
-- [ ] Bash/Python/Git/File Editor 도구 구현 (샌드박스 작업 디렉터리 강제)
-- [ ] Docker/Docker Compose/K8s 도구 구현 (읽기 전용 우선, 쓰기 작업은 확인 절차)
-- [ ] SSH 도구 구현 (`SSH_ALLOWED_HOSTS` 화이트리스트, 키 기반 인증만 허용)
-- [ ] Playwright/Browser 도구 구현 (Web Bot 연결)
-- [ ] DB 도구 구현 (MySQL/PostgreSQL 우선, Oracle/Tibero는 커넥터 확인 후 추가, 접속정보는 전부 `.env`)
-- [ ] MCP 클라이언트 통합 (외부 MCP 서버 plug-in 방식 연결)
+### Phase 4 — Tool 정책 / 샌드박스 구성
+- [ ] Coding agent: `tools.profile: "coding"` (exec/fs/web/sessions)
+- [ ] Analysis agent: 읽기 위주 + 향후 RAG/MCP 연결 지점 확보
+- [ ] Web agent: `browser` 툴 활성화, sandbox browser 네트워크 격리 확인
+- [ ] Server agent: `sandbox.backend: "ssh"`로 대상 Ubuntu 서버 원격 실행 구성, `tools.elevated`는 최소한만 허용
+- [ ] 각 agent `tools.allow/deny`로 과도한 권한 제거 (특히 Server agent의 쓰기/삭제성 명령)
 
-### Phase 5 — 나머지 Bot 3종 연결 (1주)
-- [ ] Analysis Bot (로그/PDF/CSV/RAG 파이프라인 — 임베딩 저장소 선정: 초기엔 SQLite+FTS 또는 Chroma)
-- [ ] Web Bot (검색 API + Playwright 크롤링 결과 요약 파이프라인, `SEARCH_PROVIDER`/`SEARCH_API_KEY` 사용)
-- [ ] Server Bot (서버 상태 조회/재시작 — 고위험 명령은 반드시 사용자 확인 단계 삽입)
+### Phase 5 — 부족한 부분 커스텀 구현
+- [ ] **DB 도구**: PostgreSQL/MySQL은 기존 오픈소스 MCP 서버 조사 후 `mcp.servers`에 등록
+- [ ] **Oracle/Tibero**: 기존 MCP 서버 존재 여부 조사 → 없으면 최소 기능(조회 전용) 자체 MCP 서버 작성
+- [ ] **(선택) 동적 모델 라우팅**: 정말 필요하다면 요청 분류 후 세션 모델을 즉석에서 바꾸는 소형 훅/확장 작성
+  (`session_status(model=...)` 또는 `/model` 전환 메커니즘 활용) — V1 범위에서는 생략 가능,
+  agent별 고정 모델 배정으로 실용적으로 충분한지 먼저 운영하며 판단
 
-### Phase 6 — 추가 Provider 확장 (병행 가능)
-- [ ] V1.0의 4개 provider(Claude Max/OpenRouter/OpenAI/Ollama) 외 신규 provider(Gemini, DeepSeek 등) 추가 시 절차 검증
-- [ ] 검색 API Provider (Brave/SerpAPI/Tavily 등, `.env`의 `SEARCH_PROVIDER`로 스위치)
-- [ ] Provider 플러그인 등록 방식 문서화 (신규 LLM 추가 시 `.env` + `models.yaml` 체크리스트)
-
-### Phase 7 — 운영/안정화 (Ubuntu 배포) (1주)
-- [ ] Ubuntu 서버에 `scripts/install.sh`로 의존성 설치 (Python venv, Redis, systemd 유닛 등록)
-- [ ] systemd 서비스 등록 (또는 `docker compose --restart always`)로 24시간 구동
-- [ ] 헬스체크 + 자동 재시작
-- [ ] 비용/사용량 로그 대시보드 (간단한 CLI 리포트 또는 로그 집계)
-- [ ] 에러 알림 (Telegram 관리자 채널로 장애 알림)
-- [ ] 백업 (세션/설정/로그 주기적 백업, `.env`는 별도 안전한 위치에 백업)
+### Phase 6 — 운영/배포 (Ubuntu, 24시간)
+- [ ] 설치 스크립트 기반 systemd 서비스 등록 (또는 Docker Compose)
+- [ ] 헬스체크(`openclaw channels status`, `gateway health`), 자동 재시작
+- [ ] `~/.openclaw` 상태 디렉터리(세션/인증/설정) 백업
+- [ ] 로그/사용량 확인 방법 정리 (OpenClaw 자체 로깅/진단 명령 활용)
 
 ---
 
-## 5. 주요 리스크 & 결정 필요 사항
+## 6. 주요 리스크 & 결정 필요 사항
 
 | 항목 | 리스크 | 결정 필요 |
 |---|---|---|
-| Claude Max Wrapper 인증 | CLI 로그인 세션 방식이라 컨테이너 재시작/서버 이전 시 재로그인 필요 가능 | `CLAUDE_CONFIG_DIR`을 영속 볼륨/디렉터리로 고정, 세션 만료 감지 및 알림 |
-| Claude Max Wrapper 동시성 | CLI 기반이라 동시 세션/Rate limit 이슈 가능 | 큐 직렬화 정책, 동시 실행 수 제한 |
-| Ollama API 엔드포인트 | 이 프로젝트는 Ollama를 설치하지 않으므로 접속할 서버가 반드시 별도로 이미 구동 중이어야 함 | 실제 Ollama 서버 주소/네트워크 접근성 확인 (아직 없다면 어디에 둘지 결정 필요) |
-| Placeholder 모델 배정 | V1.0의 역할→provider 매핑(예: fast=ollama, analysis=openai)은 임의 지정이라 실제 성능/비용에 안 맞을 수 있음 | 운영 중 `models.yaml`의 `routing` 순서만 조정하면 되므로 초기엔 결정 지연 가능, 실사용 데이터로 추후 튜닝 |
-| 도구 권한 (Bash/SSH/DB) | 잘못된 명령으로 서버 손상 위험 | 위험 명령 목록 정의 + 실행 전 사용자 확인(Telegram 버튼) 도입 여부 |
-| RAG/문서 저장소 | 벡터 DB 선택 미정 | Chroma(로컬, 간단) vs pgvector(확장성) 결정 |
-| 인증 | Telegram만으로 충분한가 | 다중 관리자/사용자 시 역할별 권한 분리 필요 여부 |
-| 비밀값 관리 | `.env` 파일 유출 시 전체 키 노출 | 파일 권한(600), git 제외, 서버 반입 시 안전한 전달 방식 확정 |
+| Claude Max 구독 사용 정책 | `docs/providers/claude-max-api-proxy.md`에 Anthropic이 Claude Code 외 구독 사용을 제한할 수 있다는 경고 존재. 단, 우리는 프록시가 아니라 OpenClaw의 **네이티브 CLI backend**(공식 지원 경로)를 쓰므로 리스크 낮음 — 그래도 확인 필요 | 최신 Anthropic 정책 재확인 |
+| Task-복잡도 기반 자동 라우팅 부재 | agent당 모델이 고정이라 "간단한 질문→Fast, 복잡한 질문→Reasoning" 자동 전환은 기본 미지원 | Phase 5까지 없이 운영해보고 실제로 필요한지 판단 (많은 경우 agent별 고정 모델로 충분) |
+| DB 커넥터(Oracle/Tibero) | 검증된 MCP 서버가 없을 가능성 높음 | 직접 작성 범위/일정 확정 필요 |
+| Server agent 권한 | SSH sandbox backend로 원격 서버 실행 시 권한 범위(쓰기/삭제/재시작) 통제 필요 | `tools.elevated`, `tools.allow/deny` 세부 정책 확정, 위험 명령 실행 전 Telegram 확인 절차 필요 여부 |
+| fork 관리 | OpenClaw 업스트림이 활발히 개발 중(active, 잦은 커밋) — fork를 그대로 두면 업데이트 추적 필요 | 커스텀 확장은 `extensions/`에만 넣어 업스트림 rebase 충돌 최소화, 정기 업스트림 sync 정책 필요 |
+| 비밀값 관리 | `.env` 유출 시 전체 키 노출 (기존 리스크 동일) | 파일 권한, git 제외 유지 |
 
 ---
 
-## 6. 다음 액션
+## 7. 다음 액션
 
-1. 4개 provider(Claude Max/OpenRouter/OpenAI/Ollama) 키·엔드포인트 확보 — 역할별 모델 배정은 placeholder로 두고 진행 (나중에 `routing` 순서만 변경)
-2. `.env.example` 초안에 동의하는지 확인 후 Phase 0~1 스캐폴딩 시작
-3. Ubuntu 서버 접근 정보 확보 (SSH 접속 가능 여부) → `scripts/install.sh` 작성 및 실제 배포 테스트
+1. Phase 0 항목(Telegram 봇 4개 토큰, OpenRouter/OpenAI 키, Ollama 서버 주소, Ubuntu 서버 준비) 확보
+2. `openclaw.json` 초안(4-agent/4-binding) 작성 → Phase 1~2 실제 배포 테스트
+3. DB 도구(Phase 5)에서 쓸 MCP 서버 후보 조사 (Postgres/MySQL 우선, Oracle/Tibero는 추가 조사)
